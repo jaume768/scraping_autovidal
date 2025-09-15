@@ -1,285 +1,320 @@
+# autovidal_scraper.py
+import csv
+import re
+import time
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, urljoin
 import requests
 from bs4 import BeautifulSoup
-import csv
-import time
-import re
-from urllib.parse import urljoin
 
-class AutoVidalScraper:
-    def __init__(self):
-        self.base_url = "https://autovidal.es"
-        self.session = requests.Session()
-        # Headers para evitar ser bloqueado
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        })
-        self.car_urls = []
+BASE_URL = "https://autovidal.es/coches-usados/"
+HEADERS = {
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "accept-language": "es-ES,es;q=0.9"
+}
+TIMEOUT = 20
+SLEEP = (0.6, 1.2)  # min/max seconds between requests
 
-    def get_car_urls_from_page(self, page_url):
-        """Extrae las URLs de los coches de una página específica"""
+session = requests.Session()
+session.headers.update(HEADERS)
+
+
+def sleep_a_bit():
+    lo, hi = SLEEP
+    time.sleep(lo + (hi - lo) * 0.5)
+
+
+def get_soup(url):
+    resp = session.get(url, timeout=TIMEOUT)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "lxml")
+
+
+def clean_text(txt: str) -> str:
+    if not txt:
+        return ""
+    t = re.sub(r"\s+", " ", txt).strip()
+    return t
+
+def normalize_price_to_int(price_str: str) -> str:
+    """
+    Convierte '27.800' o '27.800,00' o '27 800' en '27800' (solo dígitos).
+    Devuelve cadena para que el CSV no cambie tipos; si prefieres int, usa int(...).
+    """
+    if not price_str:
+        return ""
+    # Quitar todo lo que no sea dígito
+    digits = re.sub(r"\D", "", price_str)
+    return digits
+
+def clean_price(txt: str) -> str:
+    """
+    Devuelve solo la parte numérica del precio (sin símbolo €).
+    Mantiene el formato que venga de la web (p. ej., '27.800' o '27.800,00').
+    """
+    if not txt:
+        return ""
+    t = clean_text(txt)
+
+    # 1) Si viene como "27.800 €" o "27.800,00 €"
+    m = re.search(r"(\d[\d\.\s]*[,\.]?\d*)\s*€", t)
+    if m:
+        return clean_text(m.group(1))
+
+    # 2) Si viene solo con números (p.ej. desde meta price)
+    m2 = re.search(r"\d[\d\.\s]*[,\.]?\d*", t)
+    return clean_text(m2.group(0)) if m2 else ""
+
+
+def title_from_url(path_segment: str) -> str:
+    # Convierte slug a título: "mercedes-benz" -> "Mercedes-Benz"
+    seg = path_segment.replace("-", " ").strip()
+    return " ".join(w.capitalize() if w.upper() != "PHEV" else "PHEV" for w in seg.split())
+
+
+def extract_make_model_from_detail_url(detail_url: str):
+    """
+    La URL típica es:
+    /coches/segunda-mano/islas-baleares/mercedes-benz/vito/diesel/...
+    Tomamos los segmentos marca y modelo si existen.
+    """
+    try:
+        path = urlparse(detail_url).path.strip("/")
+        parts = path.split("/")
+        # Buscar posición de "/coches/"
+        if "coches" in parts:
+            i = parts.index("coches")
+            # Marca suele ser parts[i+3], Modelo parts[i+4] (depende del patrón)
+            # Estructura vista: coches / segunda-mano / islas-baleares / <marca> / <modelo> / <combustible> / ...
+            if len(parts) > i + 5:
+                marca = title_from_url(parts[i + 3])
+                modelo = title_from_url(parts[i + 4])
+                return marca, modelo
+    except Exception:
+        pass
+    return "", ""
+
+
+def find_next_page(soup, current_url):
+    """
+    Intenta localizar el enlace a la siguiente página en distintos patrones comunes.
+    """
+    # rel=next
+    a = soup.select_one('a[rel="next"]')
+    if a and a.get("href"):
+        return urljoin(current_url, a["href"])
+
+    # aria-label Siguiente
+    for sel in [
+        'a[aria-label*="Siguiente" i]',
+        'a[title*="Siguiente" i]',
+        ".pagination a.next",
+        ".pager a.next",
+        "a.page-numbers.next",
+    ]:
+        a = soup.select_one(sel)
+        if a and a.get("href"):
+            return urljoin(current_url, a["href"])
+
+    # En muchos WP, paginación tipo /page/2/
+    # Si no encontramos next, devolvemos None
+    return None
+
+
+def parse_listing_collect_detail_urls(listing_url: str):
+    """
+    Devuelve un set de URLs de detalle de coches desde una URL de listado.
+    """
+    soup = get_soup(listing_url)
+    sleep_a_bit()
+    urls = set()
+
+    # En el HTML dado, los enlaces están en <a class="vcard--link" href="...">
+    for a in soup.select("a.vcard--link[href]"):
+        href = a.get("href")
+        if href and "/coches/" in href:
+            urls.add(urljoin(listing_url, href))
+
+    return urls, soup
+
+
+def page_url(base_url: str, page: int) -> str:
+    """
+    Devuelve base_url con ?page=N (si N>1). Mantiene otros parámetros si ya existen.
+    """
+    if page <= 1:
+        return base_url
+    u = urlparse(base_url)
+    qs = dict(parse_qsl(u.query, keep_blank_values=True))
+    qs["page"] = str(page)
+    new_q = urlencode(qs, doseq=True)
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
+
+
+def enumerate_all_listing_pages(start_url: str, max_pages: int = 200):
+    """
+    Recorre todas las páginas usando ?page=N hasta que no haya resultados
+    o se alcance max_pages. Devuelve un set con todas las URLs de detalle.
+    """
+    all_detail_urls = set()
+    page = 1
+    while page <= max_pages:
+        current = page_url(start_url, page)
         try:
-            print(f"Scrapeando página: {page_url}")
-            response = self.session.get(page_url, timeout=10)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Buscar todos los div de vehículos
-            vehicle_divs = soup.find_all('div', class_='dpdsh-storefront__vehicle')
-            
-            urls_found = []
-            for div in vehicle_divs:
-                # Buscar el enlace del vehículo
-                link = div.find('a', href=True)
-                if link and '/vehiculo/' in link['href']:
-                    full_url = urljoin(self.base_url, link['href'])
-                    urls_found.append(full_url)
-                    print(f"  Encontrado coche: {full_url}")
-            
-            print(f"  Total coches encontrados en esta página: {len(urls_found)}")
-            return urls_found
-            
-        except requests.RequestException as e:
-            print(f"Error al acceder a {page_url}: {e}")
-            return []
+            detail_urls, _ = parse_listing_collect_detail_urls(current)
         except Exception as e:
-            print(f"Error inesperado al procesar {page_url}: {e}")
-            return []
+            print(f"[WARN] Error leyendo {current}: {e}")
+            break
 
-    def get_all_car_urls(self, max_pages=15):
-        """Obtiene todas las URLs de coches navegando por las páginas paginadas"""
-        print("=== INICIANDO EXTRACCIÓN DE URLS DE COCHES ===")
-        
-        # Empezar con la primera página
-        page = 1
-        base_list_url = "https://autovidal.es/coches-usados"
-        
-        while page <= max_pages:
-            if page == 1:
-                page_url = base_list_url
+        if not detail_urls:
+            print(f"[INFO] Fin de paginación en page={page} (sin resultados).")
+            break
+
+        print(f"[INFO] page={page} -> {len(detail_urls)} URLs")
+        all_detail_urls.update(detail_urls)
+        page += 1  # siguiente página
+
+    return all_detail_urls
+
+
+
+def extract_plate(soup: BeautifulSoup) -> str:
+    # Basado en el bloque facilitado:
+    # li.stock-vehicle-highlights-list__item--plate-number .stock-vehicle-highlights-list__item-value
+    el = soup.select_one(
+        ".stock-vehicle-highlights-list__item--plate-number .stock-vehicle-highlights-list__item-value"
+    )
+    if el:
+        return clean_text(el.get_text())
+    # Fallbacks habituales
+    for sel in [
+        'li[class*="plate"] .stock-vehicle-highlights-list__item-value',
+        'li[class*="matr"] .stock-vehicle-highlights-list__item-value',
+        'span:contains("Matrícula") + span',
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            return clean_text(el.get_text())
+    # Último recurso: buscar patrón matrícula (XXXXXXX con letras/números)
+    txt = soup.get_text(" ", strip=True)
+    m = re.search(r"\b([0-9]{4}[A-Z]{3}|[A-Z]{1,2}-\d{4}-[A-Z]{1,2}|[A-Z0-9]{6,8})\b", txt)
+    return m.group(1) if m else ""
+
+
+def extract_price(soup: BeautifulSoup) -> str:
+    # Intento 1: meta schema.org
+    meta = soup.select_one('meta[itemprop="price"]')
+    if meta and meta.get("content"):
+        # Intentar sacar currency también
+        curr = "€"
+        curr_meta = soup.select_one('meta[itemprop="priceCurrency"]')
+        if curr_meta and curr_meta.get("content"):
+            if curr_meta["content"].upper() == "EUR":
+                curr = "€"
+        return clean_price(meta.get("content", ""))
+
+    # Intento 2: selectores típicos de precio en la ficha
+    for sel in [
+        ".stock-vehicle-purchase__price .price__amount",
+        ".stock-vehicle-price__price .price__amount",
+        ".vehicle-price .price__amount",
+        ".price__current",
+        ".price .amount",
+        ".vcard-price__price",  # por si en detalle reutilizan
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            return clean_price(el.get_text())
+
+    # Último recurso: buscar el primer número con símbolo euro
+    txt = soup.get_text(" ", strip=True)
+    return clean_price(txt)
+
+
+def extract_title_based_make_model(soup: BeautifulSoup):
+    # Preferimos <h1> principal de la ficha
+    h1 = soup.find("h1")
+    if h1:
+        title = clean_text(h1.get_text())
+        # Partimos por espacio: primera palabra(s) pueden ser la marca con guiones
+        # Heurística: si contiene marca + modelo juntos (p. ej. "Mercedes-Benz Vito")
+        parts = title.split()
+        if len(parts) >= 2:
+            # Marca: primera palabra (o 2 si la primera contiene '-')
+            if "-" in parts[0] and len(parts) >= 2:
+                marca = parts[0]
+                modelo = " ".join(parts[1:])
             else:
-                page_url = f"{base_list_url}/page/{page}"
-            
-            urls_from_page = self.get_car_urls_from_page(page_url)
-            
-            if not urls_from_page:
-                print(f"No se encontraron más coches en la página {page}. Terminando.")
-                break
-            
-            self.car_urls.extend(urls_from_page)
-            page += 1
-            
-            # Pausa entre páginas para ser respetuosos
-            time.sleep(2)
-        
-        # Eliminar duplicados
-        self.car_urls = list(set(self.car_urls))
-        print(f"\n=== RESUMEN ===")
-        print(f"Total de URLs únicas encontradas: {len(self.car_urls)}")
-        return self.car_urls
+                marca = parts[0]
+                modelo = " ".join(parts[1:])
+            return clean_text(marca), clean_text(modelo)
 
-    def get_car_details(self, car_url):
-        """Extrae los detalles completos de un coche desde su página individual"""
-        try:
-            print(f"Extrayendo detalles de: {car_url}")
-            response = self.session.get(car_url, timeout=15)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Inicializar datos
-            car_data = {
-                'matricula': 'N/A',
-                'marca': 'N/A', 
-                'modelo': 'N/A',
-                'precio': 'N/A'
-            }
-            
-            # MÉTODO 1: Intentar extraer de los campos hidden del formulario (más confiable)
-            hidden_inputs = soup.find_all('input', {'type': 'hidden'})
-            for input_elem in hidden_inputs:
-                name = input_elem.get('name', '')
-                value = input_elem.get('value', '')
-                
-                if name == 'matricula' and value:
-                    car_data['matricula'] = value.strip()
-                elif name == 'marca' and value:
-                    car_data['marca'] = value.strip()
-                elif name == 'modelo' and value:
-                    car_data['modelo'] = value.strip() 
-                elif name == 'precio' and value:
-                    car_data['precio'] = value.strip()
-            
-            # MÉTODO 2: Si no encontramos datos en los hidden, usar los elementos HTML
-            if car_data['matricula'] == 'N/A':
-                matricula_elem = soup.find('span', {'data-postname': 'number_plate'})
-                if matricula_elem:
-                    car_data['matricula'] = matricula_elem.get_text(strip=True)
-            
-            if car_data['marca'] == 'N/A':
-                # Buscar en la sección de datos técnicos
-                marca_sections = soup.find_all('div', class_='dpdsh-taxonomy__container')
-                for section in marca_sections:
-                    prev_text = section.find_previous('div', class_='ct-text-block')
-                    if prev_text and 'Marca:' in prev_text.get_text():
-                        car_data['marca'] = section.get_text(strip=True)
-                        break
-            
-            if car_data['modelo'] == 'N/A':
-                # Buscar en la sección de datos técnicos
-                modelo_sections = soup.find_all('div', class_='dpdsh-taxonomy__container')
-                for section in modelo_sections:
-                    prev_text = section.find_previous('div', class_='ct-text-block')
-                    if prev_text and 'Modelo:' in prev_text.get_text():
-                        car_data['modelo'] = section.get_text(strip=True)
-                        break
-            
-            # Si aún no tenemos precio, intentar extraerlo de otros lugares
-            if car_data['precio'] == 'N/A':
-                # Buscar precio en la página
-                precio_patterns = [
-                    r'Precio[^:]*:?\s*([\d.,]+)\s*€',
-                    r'([\d.,]+)\s*€',
-                ]
-                page_text = soup.get_text()
-                for pattern in precio_patterns:
-                    precio_match = re.search(pattern, page_text, re.IGNORECASE)
-                    if precio_match:
-                        car_data['precio'] = precio_match.group(1).replace('.', '').replace(',', '')
-                        break
-            
-            print(f"  ✓ Matrícula: {car_data['matricula']}")
-            print(f"  ✓ Marca: {car_data['marca']}")
-            print(f"  ✓ Modelo: {car_data['modelo']}")
-            print(f"  ✓ Precio: {car_data['precio']}")
-            
-            return car_data
-            
-        except requests.RequestException as e:
-            print(f"  ✗ Error de conexión con {car_url}: {e}")
-            return None
-        except Exception as e:
-            print(f"  ✗ Error inesperado al procesar {car_url}: {e}")
-            return None
-    
-    def scrape_all_cars_details(self, urls_file="car_urls.txt", max_cars=None):
-        """Extrae los detalles de todos los coches y genera un CSV"""
-        print("\n=== INICIANDO EXTRACCIÓN DE DETALLES DE COCHES ===\n")
-        
-        # Leer URLs del archivo
-        try:
-            with open(urls_file, 'r', encoding='utf-8') as f:
-                urls = [line.strip() for line in f if line.strip()]
-        except FileNotFoundError:
-            print(f"Error: No se encontró el archivo {urls_file}")
-            return []
-        
-        if max_cars:
-            urls = urls[:max_cars]
-        
-        cars_data = []
-        total_urls = len(urls)
-        
-        for i, url in enumerate(urls, 1):
-            print(f"[{i}/{total_urls}] Procesando coche...")
-            
-            car_details = self.get_car_details(url)
-            if car_details:
-                cars_data.append(car_details)
-            
-            # Pausa entre requests para ser respetuosos
-            time.sleep(1)
-        
-        return cars_data
-    
-    def save_to_csv(self, cars_data, filename="VEHICULOS.csv"):
-        """Guarda los datos de los coches en un archivo CSV"""
-        if not cars_data:
-            print("No hay datos para guardar en CSV")
-            return
-        
-        try:
-            with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                fieldnames = ['Matricula', 'Marca', 'Modelo', 'Precio']
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                
-                # Escribir cabecera
-                writer.writeheader()
-                
-                # Escribir datos
-                for car in cars_data:
-                    writer.writerow({
-                        'Matricula': car['matricula'],
-                        'Marca': car['marca'],
-                        'Modelo': car['modelo'],
-                        'Precio': car['precio']
-                    })
-            
-            print(f"\n✅ Datos guardados en {filename}")
-            print(f"✅ Total de coches procesados: {len(cars_data)}")
-            
-        except Exception as e:
-            print(f"Error al guardar CSV: {e}")
+    # Fallback: meta og:title
+    og = soup.select_one('meta[property="og:title"]')
+    if og and og.get("content"):
+        title = clean_text(og["content"])
+        parts = title.split()
+        if len(parts) >= 2:
+            marca = parts[0]
+            modelo = " ".join(parts[1:])
+            return clean_text(marca), clean_text(modelo)
 
-    def save_urls_to_file(self, filename="car_urls.txt"):
-        """Guarda las URLs encontradas en un archivo de texto"""
-        with open(filename, 'w', encoding='utf-8') as f:
-            for url in self.car_urls:
-                f.write(f"{url}\n")
-        print(f"URLs guardadas en {filename}")
+    return "", ""
+
+
+def scrape_car(detail_url: str):
+    soup = get_soup(detail_url)
+    sleep_a_bit()
+
+    # Matrícula (desde bloque que nos pasaste)
+    matricula = extract_plate(soup)
+
+    # Marca / Modelo: 1) desde H1/og:title; 2) desde la URL
+    marca, modelo = extract_title_based_make_model(soup)
+    if not marca or not modelo:
+        m2, mo2 = extract_make_model_from_detail_url(detail_url)
+        marca = marca or m2
+        modelo = modelo or mo2
+
+    # Precio
+    precio = normalize_price_to_int(extract_price(soup))
+
+    return {
+        "Matricula": matricula,
+        "Marca": marca,
+        "Modelo": modelo,
+        "Precio": precio,
+    }
+
 
 def main():
-    scraper = AutoVidalScraper()
-    
-    # FASE 1: Obtener URLs (ya completada anteriormente)
-    print("=== FASE 1: OBTENER URLS DE COCHES ===")
-    
-    # Verificar si ya tenemos el archivo de URLs
-    import os
-    if os.path.exists("car_urls.txt"):
-        print("✅ Archivo car_urls.txt encontrado. Saltando extracción de URLs...")
-        with open("car_urls.txt", 'r', encoding='utf-8') as f:
-            car_urls = [line.strip() for line in f if line.strip()]
-        print(f"✅ {len(car_urls)} URLs cargadas desde el archivo")
-    else:
-        print("🔄 Extrayendo URLs de coches...")
-        car_urls = scraper.get_all_car_urls(max_pages=20)
-        scraper.save_urls_to_file()
-        print(f"✅ {len(car_urls)} URLs extraídas y guardadas")
-    
-    # FASE 2: Extraer detalles de cada coche
-    print("\n=== FASE 2: EXTRAER DETALLES DE CADA COCHE ===")
-    
-    # Para prueba inicial, procesar solo los primeros 10 coches
-    # Puedes cambiar este número o quitar la limitación
-    MAX_CARS_TEST = None  # Cambiar a None para procesar todos
-    
-    if MAX_CARS_TEST:
-        print(f"⚠️  MODO PRUEBA: Procesando solo los primeros {MAX_CARS_TEST} coches")
-        print("   (Cambia MAX_CARS_TEST = None en el código para procesar todos)")
-    
-    cars_data = scraper.scrape_all_cars_details(max_cars=MAX_CARS_TEST)
-    
-    # FASE 3: Generar CSV
-    print("\n=== FASE 3: GENERAR CSV ===")
-    scraper.save_to_csv(cars_data)
-    
-    print(f"\n🎉 PROCESO COMPLETADO 🎉")
-    print(f"📊 Total URLs encontradas: {len(car_urls)}")
-    print(f"📊 Total coches procesados: {len(cars_data)}")
-    print(f"📁 Archivo CSV generado: coches_autovidal.csv")
-    print("\n✅ Revisa el archivo 'coches_autovidal.csv' en la misma carpeta donde está este ejecutable.")
-    
-    # Pausa al final para evitar que se cierre la ventana
-    try:
-        input("\nPresiona ENTER para cerrar...")
-    except:
-        pass  # En caso de que no se pueda leer input
+    print("[INFO] Recolectando enlaces de coches…")
+    detail_urls = enumerate_all_listing_pages(BASE_URL)
+    print(f"[INFO] Encontradas {len(detail_urls)} fichas.")
+
+    rows = []
+    for i, url in enumerate(sorted(detail_urls)):
+        try:
+            data = scrape_car(url)
+            # Solo guardamos si tiene algo de info
+            if any(data.values()):
+                rows.append(data)
+            print(f"[OK] ({i+1}/{len(detail_urls)}) {url} -> {data['Matricula']} | {data['Marca']} {data['Modelo']} | {data['Precio']}")
+        except Exception as e:
+            print(f"[WARN] Error en {url}: {e}")
+
+    # Escritura CSV
+    out_file = "coches_autovidal.csv"
+    with open(out_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["Matricula", "Marca", "Modelo", "Precio"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[DONE] Guardado en {out_file}. Registros: {len(rows)}")
+
 
 if __name__ == "__main__":
     main()
