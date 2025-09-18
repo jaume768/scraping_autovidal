@@ -1,12 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_dynamic_libs
+
+binaries = []
+binaries += collect_dynamic_libs('lxml')
 
 
 a = Analysis(
     ['autovidal_scraper.py'],
     pathex=[],
-    binaries=[],
+    binaries=binaries,
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['bs4'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

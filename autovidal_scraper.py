@@ -269,15 +269,23 @@ def scrape_car(detail_url: str):
     soup = get_soup(detail_url)
     sleep_a_bit()
 
-    # Matrícula (desde bloque que nos pasaste)
+    # Matrícula
     matricula = extract_plate(soup)
 
-    # Marca / Modelo: 1) desde H1/og:title; 2) desde la URL
+    # Marca / Modelo (tal como haces ahora)
     marca, modelo = extract_title_based_make_model(soup)
     if not marca or not modelo:
         m2, mo2 = extract_make_model_from_detail_url(detail_url)
         marca = marca or m2
         modelo = modelo or mo2
+
+    # >>> NUEVO: unir marca + primera palabra del "modelo" para que sea "Maserati Levante"
+    modelo_tokens = (modelo or "").split()
+    if modelo_tokens:
+        marca = f"{marca} {modelo_tokens[0]}".strip()   # p.ej. "Maserati Levante"
+        modelo = " ".join(modelo_tokens[1:])            # p.ej. "2.0 MHEV GT..."
+
+    modelo = (modelo or "")[:6]
 
     # Precio
     precio = normalize_price_to_int(extract_price(soup))
@@ -290,30 +298,64 @@ def scrape_car(detail_url: str):
     }
 
 
+
+
 def main():
-    print("[INFO] Recolectando enlaces de coches…")
-    detail_urls = enumerate_all_listing_pages(BASE_URL)
-    print(f"[INFO] Encontradas {len(detail_urls)} fichas.")
-
-    rows = []
-    for i, url in enumerate(sorted(detail_urls)):
+    try:
+        print("[INFO] Iniciando AutoVidal Scraper...")
+        print("[INFO] Verificando conectividad...")
+        
+        # Test de conectividad básico
         try:
-            data = scrape_car(url)
-            # Solo guardamos si tiene algo de info
-            if any(data.values()):
-                rows.append(data)
-            print(f"[OK] ({i+1}/{len(detail_urls)}) {url} -> {data['Matricula']} | {data['Marca']} {data['Modelo']} | {data['Precio']}")
+            resp = session.get(BASE_URL, timeout=10)
+            print(f"[INFO] Conectividad OK - Status: {resp.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"[ERROR] Problema de conectividad: {e}")
+            input("Presiona Enter para continuar...")
+            return
+        
+        print("[INFO] Recolectando enlaces de coches…")
+        detail_urls = enumerate_all_listing_pages(BASE_URL)
+        print(f"[INFO] Encontradas {len(detail_urls)} fichas.")
+
+        if not detail_urls:
+            print("[ERROR] No se encontraron coches. Puede que el sitio web haya cambiado.")
+            input("Presiona Enter para continuar...")
+            return
+
+        rows = []
+        for i, url in enumerate(sorted(detail_urls)):
+            try:
+                data = scrape_car(url)
+                # Solo guardamos si tiene algo de info
+                if any(data.values()):
+                    rows.append(data)
+                print(f"[OK] ({i+1}/{len(detail_urls)}) {url} -> {data['Matricula']} | {data['Marca']} {data['Modelo']} | {data['Precio']}")
+            except Exception as e:
+                print(f"[WARN] Error en {url}: {e}")
+
+        # Escritura CSV
+        out_file = "VEHICULOS.csv"
+        try:
+            with open(out_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["Matricula", "Marca", "Modelo", "Precio"])
+                writer.writeheader()
+                writer.writerows(rows)
+            print(f"[DONE] Guardado en {out_file}. Registros: {len(rows)}")
         except Exception as e:
-            print(f"[WARN] Error en {url}: {e}")
-
-    # Escritura CSV
-    out_file = "coches_autovidal.csv"
-    with open(out_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["Matricula", "Marca", "Modelo", "Precio"])
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"[DONE] Guardado en {out_file}. Registros: {len(rows)}")
+            print(f"[ERROR] No se pudo guardar el archivo CSV: {e}")
+            
+    except Exception as e:
+        print(f"[ERROR CRÍTICO] Error inesperado: {e}")
+        print(f"[ERROR] Tipo de error: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        print("\n" + "="*50)
+        print("EJECUCIÓN COMPLETADA")
+        print("="*50)
+        input("Presiona Enter para cerrar...")
 
 
 if __name__ == "__main__":
